@@ -1,0 +1,218 @@
+#!/bin/bash
+
+# Script to resize filesystem image
+
+set -eu
+
+prg_name=${0##*/}
+MARGIN_SIZE="100M"
+PARTITION_NUMBER="1"
+OUTPUT_IMAGE_FILE=""
+REPORT_FORMAT=""
+REPORT_JSON_FILE=""
+BACKUP_IMAGE_FILE=""
+LOOP_DEVICE=""
+REQUIRED_PROGRAMS=("losetup" "e2fsck" "resize2fs" "truncate" "numfmt")
+
+usage() {
+    cat <<-EOF
+        Resize filesystem image.
+
+        Usage:
+        ${prg_name} [options]
+
+        Options:
+            -h, --help              Show this help message and exit.
+            -m, --margin SIZE       Additional size to add to the image (e.g., 100M, 1G).
+                                    (Default: 100M)
+            -p, --partition N       Select partition number N (e.g. 1 for p1).
+                                    (Default: 1)
+            -b, --backup IMG_FILE   Create a backup of the original filesystem image before modifying it.
+
+        Output options
+            -o, --output IMG_FILE   Output resized filesystem image to IMG_FILE.
+            -r, --report-json FILE  Write a report to json file.
+
+        Arguments:
+            FS_IMAGE_FILE           The filesystem image file to be resized.
+EOF
+}
+
+msg_error_exit() {
+    echo "${prg_name}: ERROR: ${*}" >&2
+    exit 1
+}
+
+msg_info() {
+    echo "${prg_name}: INFO: ${*}" >&2
+}
+
+unrecognized_option() {
+    msg_error_exit "Unrecognized option: ${1:-}"
+}
+
+missing_program() {
+    msg_error_exit "Required program not found: ${1:-}"
+}
+
+check_arguments() {
+    test -n "${2:-}" || msg_error_exit "Missing argument for ${1:-}"
+}
+
+
+# -----------------------
+# Parse command-line args
+# -----------------------
+while [ -n "${1:-}" ]; do
+    case "${1:-}" in
+        -h|--help)
+            usage
+            exit 0
+            ;;
+        -m|--margin)
+            check_arguments "${1}" "${2:-}"
+            MARGIN_SIZE=${2:-}
+            shift 2
+            ;;
+        -o|--output)
+            check_arguments "${1}" "${2:-}"
+            OUTPUT_IMAGE_FILE=${2:-}
+            shift 2
+            ;;
+        -p|--partition)
+            check_arguments "${1}" "${2:-}"
+            PARTITION_NUMBER=${2:-}
+            shift 2
+            ;;
+        -b|--backup)
+            check_arguments "${1}" "${2:-}"
+            BACKUP_IMAGE_FILE=${2:-}
+            shift 2
+            ;;
+        -r|--report-json)
+            check_arguments "${1:-}" "${2:-}"
+            REPORT_JSON_FILE=${2:-}
+            case "${REPORT_JSON_FILE}" in
+                *.json) REPORT_FORMAT="json" ;;
+                *)
+                    msg_error_exit "Cannot infer report format from extension for: ${REPORT_JSON_FILE}"
+                    ;;
+            esac
+            shift 2
+            ;;
+        --)
+            shift
+            break
+            ;;
+        -*)
+            unrecognized_option "${1:-}"
+            ;;
+        *)
+            break
+            ;;
+    esac
+done
+
+# get total of args
+ARG_NUMBER="$#"
+
+if [ "${ARG_NUMBER}" -ne 1 ]; then
+    usage
+    msg_error_exit "Incorrect number of arguments. Expected 1, got ${ARG_NUMBER}."
+fi
+
+FS_IMAGE_FILE=${1:-}
+
+[ -z "${FS_IMAGE_FILE}" ] && msg_error_exit "Filesystem image file not specified."
+[ ! -f "${FS_IMAGE_FILE}" ] && msg_error_exit "Filesystem image file not found: ${FS_IMAGE_FILE}"
+
+# -----------------------
+# Create backup if requested
+# -----------------------
+if [ -n "${BACKUP_IMAGE_FILE}" ]; then
+    msg_info "Creating backup of ${FS_IMAGE_FILE} → ${BACKUP_IMAGE_FILE} ..."
+    cp --sparse=always "${FS_IMAGE_FILE}" "${BACKUP_IMAGE_FILE}"
+fi
+
+# -----------------------
+# Use output file or not
+# -----------------------
+if [ -n "${OUTPUT_IMAGE_FILE}" ]; then
+    msg_info "Copying ${FS_IMAGE_FILE} → ${OUTPUT_IMAGE_FILE} ..."
+    cp --sparse=always "${FS_IMAGE_FILE}" "${OUTPUT_IMAGE_FILE}"
+    TARGET_IMAGE_FILE="${OUTPUT_IMAGE_FILE}"
+else
+    TARGET_IMAGE_FILE="${FS_IMAGE_FILE}"
+fi
+
+# -----------------------
+# Check for required programs
+# -----------------------
+for prog in "${REQUIRED_PROGRAMS}"; do
+    command -v "${prog}" >/dev/null 2>&1 || missing_program "${prog}"
+done
+
+cleanup() {
+    if [ -n "${LOOP_DEVICE}" ]; then
+        if losetup "${LOOP_DEVICE}" >/dev/null 2>&1; then
+            losetup -d "${LOOP_DEVICE}" >/dev/null 2>&1 || true
+        fi
+    fi
+}
+trap cleanup EXIT
+
+# -----------------------
+# Start resizing
+# -----------------------
+INPUT_SIZE_HUMAN=$(ls -lh "${FS_IMAGE_FILE}" | awk '{print $5}')
+msg_info "Checking filesystem integrity on ${TARGET_IMAGE_FILE}..."
+LOOP_DEVICE=$(losetup -f --show -P "${TARGET_IMAGE_FILE}")
+[ $? -ne 0 ] && msg_error_exit "Failed to set up loop device for ${TARGET_IMAGE_FILE}."
+PARTITION_DEVICE=""
+if [ -n "${PARTITION_NUMBER}" ]; then
+    PARTITION_DEVICE="${LOOP_DEVICE}p${PARTITION_NUMBER}"
+else
+    PARTITION_DEVICE="${LOOP_DEVICE}p1"
+fi
+[ ! -b "${PARTITION_DEVICE}" ] && msg_error_exit "Partition device not found: ${PARTITION_DEVICE}"
+e2fsck -f -y "${PARTITION_DEVICE}"
+msg_info "Shrinking filesystem on ${PARTITION_DEVICE} to minimum size..."
+resize2fs -M "${PARTITION_DEVICE}"
+
+# Get the new size of the filesystem in block and block size
+FS_INFO=$(tune2fs -l "${PARTITION_DEVICE}")
+BLOCK_COUNT=$(echo "${FS_INFO}" | grep 'Block count:' | awk '{print $3}')
+BLOCK_SIZE=$(echo "${FS_INFO}" | grep 'Block size:' | awk '{print $3}')
+NEW_FS_SIZE=$((BLOCK_COUNT * BLOCK_SIZE))
+
+# Detach loop device before truncating
+cleanup
+echo "${MARGIN_SIZE}"
+msg_info "Resizing image file ${TARGET_IMAGE_FILE} to ${NEW_FS_SIZE} bytes plus margin ${MARGIN_SIZE}..."
+SAFETY_MARGIN_BYTES=$(numfmt --from=iec "${MARGIN_SIZE}")
+echo "${SAFETY_MARGIN_BYTES}"
+TRUNC_SIZE=$((NEW_FS_SIZE + SAFETY_MARGIN_BYTES))
+truncate -s "${TRUNC_SIZE}" "${TARGET_IMAGE_FILE}"
+FINAL_SIZE_HUMAN=$(ls -lh "${TARGET_IMAGE_FILE}" | awk '{print $5}')
+msg_info "Resizing completed successfully."
+msg_info "Image file size reduced to $(ls -lh "${TARGET_IMAGE_FILE}" | awk '{print $5}')."
+
+
+if [ -n "${REPORT_FORMAT}" ] && [ -n "${REPORT_JSON_FILE}" ]; then
+    msg_info "Writing report to ${REPORT_JSON_FILE} ..."
+    case "${REPORT_FORMAT}" in
+        json)
+            {
+                echo "{"
+                echo "  \"filesystem_image_file\": \"${FS_IMAGE_FILE}\","
+                echo "  \"output_image_file\": \"${TARGET_IMAGE_FILE}\","
+                echo "  \"backup_image_file\": \"${BACKUP_IMAGE_FILE}\","
+                echo "  \"partition_device\": \"${PARTITION_DEVICE}\","
+                echo "  \"margin_size\": \"${MARGIN_SIZE}\","
+                echo "  \"original_size_human\": \"${INPUT_SIZE_HUMAN}\","
+                echo "  \"final_size_human\": \"${FINAL_SIZE_HUMAN}\""
+                echo "}"
+            } > "${REPORT_JSON_FILE}"
+            ;;
+    esac
+fi
