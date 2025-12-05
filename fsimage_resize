@@ -90,10 +90,12 @@ while [ -n "${1:-}" ]; do
             shift 2
             ;;
         -r|--report-json)
-            check_arguments "${1:-}" "${2:-}"
+            check_arguments "${1}" "${2:-}"
             REPORT_JSON_FILE=${2:-}
             case "${REPORT_JSON_FILE}" in
-                *.json) REPORT_FORMAT="json" ;;
+                *.json)
+                    REPORT_FORMAT="json"
+                    ;;
                 *)
                     msg_error_exit "Cannot infer report format from extension for: ${REPORT_JSON_FILE}"
                     ;;
