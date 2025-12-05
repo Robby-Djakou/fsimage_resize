@@ -187,10 +187,8 @@ NEW_FS_SIZE=$((BLOCK_COUNT * BLOCK_SIZE))
 
 # Detach loop device before truncating
 cleanup
-echo "${MARGIN_SIZE}"
 msg_info "Resizing image file ${TARGET_IMAGE_FILE} to ${NEW_FS_SIZE} bytes plus margin ${MARGIN_SIZE}..."
 SAFETY_MARGIN_BYTES=$(numfmt --from=iec "${MARGIN_SIZE}")
-echo "${SAFETY_MARGIN_BYTES}"
 TRUNC_SIZE=$((NEW_FS_SIZE + SAFETY_MARGIN_BYTES))
 truncate -s "${TRUNC_SIZE}" "${TARGET_IMAGE_FILE}"
 FINAL_SIZE_HUMAN=$(ls -lh "${TARGET_IMAGE_FILE}" | awk '{print $5}')

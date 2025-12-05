@@ -9,10 +9,6 @@ This script performs:
 - Optional backup and output redirection
 - Report generation (only JSON supported currently)
 
----
-
----
-
 ## Installation
 
 Clone this repository:
